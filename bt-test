@@ -1,0 +1,17 @@
+#!/bin/bash
+
+if [[ -z "$*" ]]; then
+	echo "this will run backup-tools with 'devel.conf' under 'test' directory"
+	echo "just gimme arguments..."
+	exit 1
+fi
+
+if [[ ! -d "test" ]]; then
+	mkdir "test"
+fi
+
+if [[ ! -L "test/.backup-tools.conf" ]]; then
+	ln -s "$(pwd)/devel.conf" "test/.backup-tools.conf"
+fi
+
+HOME="$(pwd)/test" ./backup-tools $*

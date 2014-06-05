@@ -1,0 +1,9 @@
+13a (Jun-05-2014) "A new beginning"
+
+	Fully refactored and (somewhat) optimized.
+	Only one script instance can run under each user now.
+	Various small fixes.
+
+11k (Sep-17-2012) "Grave legacy of the past"
+
+	Well, it worked well for 1.5 years...

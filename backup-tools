@@ -1,0 +1,589 @@
+#!/bin/bash
+#
+# backup-tools is a simple system/user backup wrapper
+# https://github.com/tezoulbr/backup-tools
+#
+# Copyright (c) 2012-2014 Blemjhoo Tezoulbr <tezoulbr@gmail.com>
+# License: GPLv3+ <http://gnu.org/licenses/gpl.html>
+#
+
+
+# consts
+VER="13a"
+CPT="(c) 2012-2014 tezoulbr@gmail.com"
+LIC="GPLv3"
+PROG="backup-tools"
+SHARE_DIR="/usr/share/$PROG"
+SAMPLE_CONF="$SHARE_DIR/sample.conf"
+LOGROTATE_FILE="/etc/logrotate.d/$PROG"
+TMP_TEMPLATE="/tmp/$PROG-$$-XXXXXXXXXXXXXXXX.tmp"
+NOTIFY_TIMEOUT=10000
+NOTIFY_ICON="media-floppy"
+NOTIFY_TITLE="$PROG"
+DBG_ARG_DUMP='dbg "${FUNCNAME[0]}($*)"'
+
+if [[ "$(id -u)" == "0" ]]; then
+	CONF="/etc/$PROG.conf"
+	LOG="/var/log/$PROG.log"
+	LOCK_FILE="/var/lock/$PROG"
+else
+	CONF="$HOME/.$PROG.conf"
+	LOG="$HOME/.$PROG.log"
+	LOCK_FILE="/tmp/$PROG-$USER.lock"
+fi
+
+# defaults config values
+DEBUG=0
+MAILTO=
+MERGE_LOGS=1
+SEND_LOG=1
+
+# default arg vars
+arg_help=0
+arg_version=0
+arg_init=0
+arg_cron=0
+arg_daily=0
+arg_weekly=0
+arg_monthly=0
+arg_manual=0
+arg_sync=0
+arg_custom=0
+arg_ignore=0
+arg_skip=0
+arg_verbose=0
+
+# deps
+LIBNOTIFY=0
+RSYNC=0
+TAR=0
+ARECA=0
+
+# global vars
+exit_code=0
+terminate=0
+
+
+# print message to stdout with progname prefix or new line
+function msg() {
+	if [[ -z "$*" ]]; then
+		printf "\n"
+	else
+		printf "$PROG: $*\n"
+	fi
+}
+
+
+# print message to stderr with progname prefix or new line
+function err() {
+	if [[ -z "$*" ]]; then
+		printf "\n" 2>&1
+	else
+		printf "$PROG: $*\n" 2>&1
+	fi
+}
+
+# write error message to stderr and terminate script
+# $1 - message
+# $2 - exit code (default is 1)
+function panic() {
+	err "[PANIC] $1"
+	exit "${2:-1}"
+}
+
+# write message to log file
+# $1 - message (if empty, new line is written)
+function log() {
+	if [[ -n "$LOG" ]] && [[ -w "$LOG" ]]; then
+		if [[ -z "$1" ]]; then
+			echo >> "$LOG"
+		else
+			echo "$(date '+%Y-%m-%d %H:%M:%S')	$1" >> "$LOG"
+		fi
+	else
+		panic "unable to write to the log file $LOG"
+	fi
+}
+
+# write message to log and prints to stdout or stderr
+# $1 - message
+# $2 - message type ('w' - warning, 'e' - error, 'd' - debug",
+#      'f' - fatal, empty value - regular message)
+function out() {
+	local message="$1"
+	case "$2" in
+		w) message="[WARNING] $1" ;;
+		e) message="[ERROR] $1" ;;
+		d) message="[DEBUG] $1" ;;
+		f) message="[FATAL] $1" ;;
+	esac
+	log "$message"
+	if [[ -z "$2" ]]; then
+		msg "$message"
+	else
+		err "$message"
+	fi
+}
+
+
+# call out() only in verbose mode
+function verb() {
+	(( $arg_verbose )) && out "$1" "$2"
+	return 0
+}
+
+
+# call out() only in debug mode
+function dbg() {
+	(( $DEBUG )) && out "$1" "d"
+	return 0
+}
+
+
+# terminate script correctly
+function on_exit() {
+	(( $exit_code )) && verb "there were errors" "w"
+	dbg "exiting with code $exit_code"
+	exit $exit_code
+}
+
+
+# check if dependency exists
+# $1 - dependency name
+function check_dep() {
+	if [[ -n $(which $1 2> /dev/null) ]]; then
+		return 1
+	fi
+}
+
+
+# script initialization for non-simple commands
+function on_init() {
+	# create log file if needed and check it for the write access
+	[[ -n "$LOG" ]] && touch "$LOG" &> /dev/null
+	if [[ -w "$LOG" ]]; then
+		if [[ -s "$LOG" ]]; then # add empty line if log is not empty
+			log
+		fi
+	else
+		panic "no write acces to the log file $LOG"
+	fi
+	# check dependencies
+	if ! check_dep "notify-send"; then
+		LIBNOTIFY=1
+	else
+		verb "libnotify is not installed, notifications will not be shown" "w"
+	fi
+	check_dep "rsync"
+	RSYNC=$?
+	check_dep "tar"
+	TAR=$?
+	check_dep "areca_cl"
+	ARECA=$?
+	return 0
+}
+
+# display notification (requires libnotify)
+# $1 - message to show, required
+# $2 - title, can be omitted, default is $NOTIFY_TITLE
+function notify() {
+	eval "$DBG_ARG_DUMP"
+	(( ! "$LIBNOTIFY" )) && return 1
+	[[ -z "$1" ]] && return 1
+	notify-send -u normal -t $NOTIFY_TIMEOUT -i "$NOTIFY_ICON" "${2:-$NOTIFY_TITLE}" "$1" &> /dev/null
+}
+
+
+# parse command line
+# $1 - command line
+function parse_args() {
+	eval "$DBG_ARG_DUMP"
+	declare opt
+	opt=$(getopt -o hdwmnscaiv --long help,version,init,cron,daily,weekly,monthly,manual,sync,custom,all,ignore,skip,verbose -n $PROG -- "$@")
+	(( $? != 0 )) && exit_code=1 && on_exit
+	eval set -- "$opt"
+	local narg=0
+	local excl=0
+	local tasks=0
+	local switches=0
+	while true ; do
+		case "$1" in
+			-h|--help) arg_help=1 ; let narg++ ; let excl++ ; shift ;;
+			--version) arg_version=1 ; let narg++ ; let excl++ ; shift ;;
+			--init) arg_init=1 ; let narg++ ; let excl++ ; shift ;;
+			--cron) arg_cron=1; let narg++ ; let excl++ ; shift ;;
+			-d|--daily) arg_daily=1 ; let narg++ ; let tasks++ ; shift ;;
+			-w|--weekly) arg_weekly=1 ; let narg++ ; let tasks++ ; shift ;;
+			-m|--monthly) arg_monthly=1 ; let narg++ ; let tasks++ ; shift ;;
+			-n|--manual) arg_manual=1 ; let narg++ ; let tasks++ ; shift ;;
+			-s|--sync) arg_sync=1 ; let narg++ ; let tasks++ ; shift ;;
+			-c|--custom) arg_custom=1 ; let narg++ ; let tasks++ ; shift ;;
+			-a|--all) arg_daily=1 ; arg_weekly=1 ; arg_monthly=1 ; arg_manual=1 ; arg_sync=1 ; arg_custom=1 ; let narg++ ; let tasks++ ; shift ;;
+			-i|--ignore) arg_ignore=1 ; let switches++ ;shift ;;
+			--skip) arg_skip=1 ; let switches++ ; shift ;;
+			-v|--verbose) arg_verbose=1; shift ;;
+			--) shift ; break ;;
+			*) panic "getopt internal error" ;;
+		esac
+	done
+	if (( $narg == 0 )); then
+		exit_code=1
+		err "no argument specified (-h|--help can be useful)"
+		on_exit
+	fi
+	if (( $excl > 1 || ( $excl != 0 && $tasks != 0 ) || ( $excl != 0 && $switches != 0) )); then
+		exit_code=1
+		err "too many arguments"
+		on_exit
+	fi
+}
+
+
+# show usage
+function cmd_help() {
+	cat <<- _EOF_
+	backup-tools [-h|--help] [--version] [--init] [--cron] [-d|--daily]
+	             [--w|--weekly] [-m|--monthly] [-n|--manual] [-s|--sync]
+	             [-c|--custom] [-a|--all] [-i|--ignore] [--skip]
+	             [--verbose]
+
+	    -h, --help              Show help message and exit.
+	    --version               Show version details and exit.
+
+	    --init                  Create default config if not exists.
+	    --cron                  Create cron jobs for current user.
+
+	    -d, --daily             Execute daily backup task.
+	    -w, --weekly            Execute weekly backup task.
+	    -m, --monthly           Execute monthly backup task.
+	    -n, --manual            Execute manual backup task.
+	    -s, --sync              Execute sync task.
+	    -c, --custom            Execute custom task.
+	    -a, --all               Execute all tasks.
+
+	    --skip                  Skip initialize/finalize events.
+	    -i, --ignore            Ignore errors (in tasks only).
+	    -v, --verbose           Produce more entropy.
+	_EOF_
+	on_exit
+}
+
+
+# show version
+function cmd_ver() {
+	printf "%s ver %s %s (%s)\n" "$PROG" "$VER" "$CPT" "$LIC"
+	on_exit
+}
+
+
+# copy sample config from share dir to user dir if it's not exists
+function cmd_init() {
+	if [[ -f "$CONF" ]]; then
+		err "config file $CONF already exists"
+		exit_code=1
+		return
+	fi
+	if [[ ! -f "$SAMPLE_CONF" ]]; then
+		err "cannot find $SAMPLE_CONF"
+		exit_code=1
+	else
+		cp -v "$SAMPLE_CONF" "$CONF"
+		exit_code=$?
+	fi
+	on_exit
+}
+
+
+# create cron jobs
+function cmd_cron() {
+	if [[ $(crontab -l|grep "$PROG"|wc -l) != "0" ]]; then
+		err "your crontab already contains $PROG entry, try 'crontab -e'"
+		exit_code=1
+	else
+		local cron_file=$(mktemp "/tmp/$$-$USER-crontab-XXXXXXXX")
+		crontab -l > $cron_file
+		echo "@daily $PROG -d &> /dev/null" >> $cron_file
+		echo "@weekly $PROG -w &> /dev/null" >> $cron_file
+		echo "@monthly $PROG -m &> /dev/null" >> $cron_file
+		echo "@weekly $PROG -s &> /dev/null" >> $cron_file
+		crontab "$cron_file" &> /dev/null
+		if (( $? == 0 )); then
+			out "crontab modified, edit if needed using 'crontab -e'"
+		else
+			out "failed to modify crontab" "e"
+			exit_code=1
+		fi
+		rm "$cron_file"
+	fi
+	on_exit
+}
+
+
+# perform daily backup
+function cmd_daily() {
+	task_exec "daily"
+}
+
+
+# perform weekly backup
+function cmd_weekly() {
+	task_exec "weekly"
+}
+
+
+# perform monthly backup
+function cmd_monthly() {
+	task_exec "monthly"
+}
+
+
+# perform manual backup
+function cmd_manual() {
+	task_exec "manual"
+}
+
+
+# perform sync task
+function cmd_sync() {
+	task_exec "synchronize"
+}
+
+
+# perform custom task
+function cmd_custom() {
+	task_exec "custom"
+}
+
+
+# return 1 if task function is defined, 0 otherwise
+function func_exists() {
+	if [[ -z $(type -t $1|grep "function") ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+# return mail subject for task report
+# $1 - task name
+# $2 - task exit code
+function make_subj() {
+	local subj="$(hostname) $1 task report"
+	if [[ "$(id -u)" != "0" ]]; then
+		subj="$USER@$subj"
+	fi
+	subj="[BACKUP] $subj"
+	if [[ "$2" != "0" ]]; then
+		subj="[ALERT] $subj"
+	fi
+	echo "$subj"
+}
+
+# convert timestamp to datetime
+# $1 - timestamp
+function ts2date() {
+	date -d '@'"$1" '+%c'
+}
+
+# send task report
+# $1 - task name
+# $2 - task exit code
+# $3 - task log
+# $4 - start timestamp
+# $5 - finish timestamp
+function send_report() {
+	eval "$DBG_ARG_DUMP"
+	if [[ -z "$MAILTO" ]]; then
+		return
+	fi
+	local subj=$(make_subj "$1" "$2")
+	local report=$(mktemp "$TMP_TEMPLATE")
+	local include_log=0
+	local log_excuse=""
+	echo -e "# generated by $PROG $VER\n" >> $report   
+	echo "Host:       $(hostname)" >> $report
+	echo "User:       $USER" >> $report
+	echo "Task:       $1" >> $report
+	echo "Status:     $2" >> $report
+	echo "Started:    $(ts2date $4)" >> $report
+	echo "Finished:   $(ts2date $5)" >> $report
+	echo -e "Duration:   $(date -u -d '@'$(($5 - $4)) '+%Hh %Mm %Ss')\n" >> $report
+	if [[ ! -s "$3" ]]; then
+		log_excuse="Log is not included because it is empty."
+	else
+		case "$SEND_LOG" in
+			0)  log_excuse="Log is discarded as you requested."
+				;;
+			1)  if (( $result != 0 )); then
+					log_excuse="Log is attached because of errors in task."
+					include_log=1
+				else
+					log_excuse="Log is not attached because there were no problems."
+				fi
+				;;
+			2)  log_excuse="Log is attached."
+				include_log=1
+				;;
+		esac
+	fi
+	echo "$log_excuse" >> $report
+	if (( $include_log )); then
+		local a3="-a"
+		local a4="$task_log"
+		dbg "log is included: $task_log"
+	fi
+	mail -s "$subj" "$a3" "$a4" "$MAILTO" < "$report" &> /dev/null
+	if (( $? != 0 )); then
+		out "sending log failed" "w"
+	fi
+	rm "$report" &> /dev/null
+}
+
+
+# merge task log into main log
+# $1 - log to merge
+function merge_log() {
+	eval "$DBG_ARG_DUMP"
+	if (( "$MERGE_LOGS" )); then
+		while read line
+		do
+		echo -e "\t$line" >> "$LOG"
+		done < "$1"
+	fi
+}
+
+
+# execute task
+# $1 - task name
+function task_exec() {
+	eval "$DBG_ARG_DUMP"
+	func_exists "$1"
+	if (( ! $? )); then
+		panic "task $1 does not exist"
+	fi
+	if (( $terminate == 1 )); then
+		dbg "task $1 is skipped due to an error in previous task"
+		return 1
+	fi
+	out "processing task $1..."
+	local result=0
+	local task_log=$(mktemp "$TMP_TEMPLATE")
+	local start_ts=$(date +%s)
+	"$1" "$task_log"
+	result=$?
+	local finish_ts=$(date +%s)
+	if (( $result)); then
+		out "task $1 failed ($result)" "e"
+	fi
+	merge_log "$task_log"
+	send_report "$1" "$result" "$task_log" "$start_ts" "$finish_ts"
+	rm "$task_log"
+	if (( $result != 0 )); then
+		if (( ! $arg_ignore )); then
+			dbg "terminate flag is set"
+			terminate=1
+			exit_code=1
+		fi
+	fi
+}
+
+
+# rotate user's log
+function rotate_user_log() {
+	verb "rotating log file..."
+	[[ "$(id -u)" == "0" ]] && return # don't rotate system log
+	local lr_conf=$(mktemp "$TMP_TEMPLATE")
+	local lr_state=$(mktemp "$TMP_TEMPLATE")
+	echo "$LOG {" >>"$lr_conf"
+	tail -n +2 "$LOGROTATE_FILE" >> "$lr_conf"
+	logrotate -s "$lr_state" "$lr_conf" &> /dev/null
+	if (( $? )); then
+		log "error rotating log \'$LOG\'" "w"
+	fi
+	rm "$lr_conf" &> /dev/null
+	rm "$lr_state" &> /dev/null
+}
+
+# load configuration file
+function load_conf() {
+	[[ ! -f "$CONF" ]] && panic "no config file $CONF ('--init' can be useful)"
+	[[ ! -r "$CONF" ]] && panic "no access to config file $CONF"
+	source "$CONF"
+	(( $? )) && panic "error loading config $CONF"
+}
+
+# execute initialize/finalize event
+# $1 - event name
+# returns event status (non-zero indicates error)
+function event_exec() {
+	eval "$DBG_ARG_DUMP"
+	if (( arg_skip )); then
+		dbg "event is skipped: $1"
+		return 0
+	fi
+	func_exists "$1"
+	if (( ! $? )); then
+		dbg "event does not exist: $1"
+		return 0 # this is not an error
+	fi
+	"$1"
+	local result=$?
+	dbg "$1 returned $result"
+	return $result
+}
+
+
+# main program function
+# $1 - command line
+function main() {
+	# parse command line
+	parse_args $1
+	# simple commands
+	(( $arg_help )) && cmd_help && on_exit
+	(( $arg_version )) && cmd_ver && on_exit
+	(( $arg_init )) && cmd_init && on_exit
+	(( $arg_cron )) && cmd_cron && on_exit
+	# initializing
+	on_init
+	# load config
+	load_conf
+	# rotate user log
+	rotate_user_log
+	# initialize event
+	event_exec "initialize"
+	if (( $? )); then
+		panic "initialize event failed (try --skip)"
+	fi
+	# tasks
+	(( $arg_daily )) && cmd_daily
+	(( $arg_weekly )) && cmd_weekly
+	(( $arg_monthly )) && cmd_monthly
+	(( $arg_manual )) && cmd_manual
+	(( $arg_sync )) && cmd_sync
+	(( $arg_custom )) && cmd_custom
+	# finalize event
+	event_exec "finalize"
+	if (( $? )); then
+		out "finalize event failed (try --skip)" "w"
+		exit_code=1
+	fi
+	# cleanup
+	on_exit
+}
+
+# signal handler
+function on_trap() {
+	panic "terminate signal received" 3
+}
+
+
+# script entry point
+trap "on_trap" SIGINT SIGTERM
+(
+	if ! flock -n -e  101; then
+		panic "another script instance is already running" 2
+	fi
+	main "$PROG $*"
+) 101>"$LOCK_FILE"
+
+# EOF

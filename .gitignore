@@ -1,0 +1,10 @@
+.backup-tools.log
+.backup-tools.conf
+backup-tools.1
+*.gz
+*.xz
+PKGBUILD
+backup-tools.install
+test
+pkg
+src
